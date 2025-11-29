@@ -1,16 +1,18 @@
 import io
+import base64
 import torch
 import torch.nn as nn
 from torchvision import transforms
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
 import torchvision.models as models
+import matplotlib.pyplot as plt
 import numpy as np
-from skimage.color import rgb2lab
 
-
+# ---------------------------------------------------
+# FASTAPI APP
+# ---------------------------------------------------
 app = FastAPI()
 
 app.add_middleware(
@@ -21,62 +23,76 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-def is_valid_rbc_image(pil_img):
-   
-    img = np.array(pil_img.resize((128, 128))) / 255.0
-    mean_r = img[:, :, 0].mean()
-    mean_g = img[:, :, 1].mean()
-    mean_b = img[:, :, 2].mean()
-
-    if not (0.25 < mean_r < 0.75 and 0.15 < mean_g < 0.60 and 0.20 < mean_b < 0.60):
-        return False
-
-    variance = img.var()
-    if variance < 0.02:  
-        # Too smooth = not a microscopy RBC image
-        return False
-
-    lab_img = rgb2lab(img)
-    mean_L = lab_img[:, :, 0].mean()
-    mean_A = lab_img[:, :, 1].mean()
-    mean_B = lab_img[:, :, 2].mean()
-
-    if not (30 < mean_L < 85 and -5 < mean_A < 25 and -10 < mean_B < 35):
-        return False
-
-    return True
-
+# ---------------------------------------------------
+# MODEL ARCHITECTURE (MATCH TRAINING)
+# ---------------------------------------------------
 def get_resnet18(num_classes=2):
     model = models.resnet18(pretrained=False)
 
-    # Freeze layers except layer4
     for param in model.parameters():
         param.requires_grad = False
     for param in model.layer4.parameters():
         param.requires_grad = True
 
-    # Replace final FC layer
     in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, num_classes)
+    model.fc = nn.Sequential(
+        nn.Dropout(0.3),
+        nn.Linear(in_features, num_classes)
+    )
     return model
 
-model_path = "resnet18_malaria_weights.pth"
 
-model = get_resnet18(num_classes=2)
+# ---------------------------------------------------
+# LOAD MODEL
+# ---------------------------------------------------
+model_path = "resnet18_malaria_weights.pth"
+model = get_resnet18(2)
 model.load_state_dict(torch.load(model_path, map_location="cpu"))
 model.eval()
 
 class_names = ["Parasitized", "Uninfected"]
 
+# ---------------------------------------------------
+# TRANSFORMS
+# ---------------------------------------------------
 transform = transforms.Compose([
     transforms.Resize((64, 64)),
     transforms.ToTensor(),
     transforms.Normalize([0.5]*3, [0.5]*3)
 ])
 
+
+# ---------------------------------------------------
+# IMAGE VALIDATION (Reject non-RBC images)
+# ---------------------------------------------------
+def validate_rbc_image(image: Image.Image):
+
+    w, h = image.size
+
+    # 1. Reject very large resolution images (normal photos)
+    if w > 600 or h > 600:
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload an RBC microscope image (not a normal photo)."
+        )
+
+    # 2. Reject non-square weird aspect ratios
+    ratio = max(w, h) / min(w, h)
+    if ratio > 1.5:
+        raise HTTPException(
+            status_code=400,
+            detail="Image does not look like an RBC cell crop. Please upload a valid microscope image."
+        )
+
+    return True
+
+
+# ---------------------------------------------------
+# PREDICT FUNCTION
+# ---------------------------------------------------
 def predict_image(image: Image.Image):
     tensor = transform(image).unsqueeze(0)
+
     with torch.no_grad():
         out = model(tensor)
         probs = torch.softmax(out, dim=1)
@@ -85,33 +101,120 @@ def predict_image(image: Image.Image):
 
     return class_names[pred_idx], confidence
 
+
+# ---------------------------------------------------
+# GRAD-CAM IMPLEMENTATION
+# ---------------------------------------------------
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+
+        target_layer.register_forward_hook(self._save_activation)
+        target_layer.register_backward_hook(self._save_gradient)
+
+    def _save_activation(self, module, input, output):
+        self.activations = output
+
+    def _save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def generate(self, input_tensor):
+        self.model.zero_grad()
+
+        output = self.model(input_tensor)
+        class_idx = output.argmax()
+
+        output[0, class_idx].backward()
+
+        grads = self.gradients           # [C,H,W]
+        acts = self.activations          # [C,H,W]
+
+        weights = torch.mean(grads, dim=(1, 2))  # GAP over gradients
+
+        cam = torch.sum(weights[:, None, None] * acts, dim=0)  # Weighted sum
+        cam = torch.relu(cam)
+
+        cam -= cam.min()
+        cam /= cam.max() + 1e-9
+
+        return cam.detach().cpu().numpy()
+
+
+# ---------------------------------------------------
+# BASE64 ENCODER FOR returning heatmap
+# ---------------------------------------------------
+def encode_heatmap(cam):
+    plt.figure(figsize=(3, 3))
+    plt.imshow(cam, cmap='jet', alpha=1.0)
+    plt.axis("off")
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches='tight', pad_inches=0)
+    plt.close()
+    buf.seek(0)
+
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+
+# ---------------------------------------------------
+# NORMAL PREDICTION ENDPOINT
+# ---------------------------------------------------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
         content = await file.read()
         image = Image.open(io.BytesIO(content)).convert("RGB")
-    except Exception:
+    except:
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
-    if not is_valid_rbc_image(image):
-        return {
-            "valid": False,
-            "error": "Please upload an RBC cell image (Thin Blood Smear)."
-        }
-
+    validate_rbc_image(image)
     label, confidence = predict_image(image)
 
     return {
-        "valid": True,
         "prediction": label,
         "confidence": round(confidence * 100, 2)
     }
 
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "message": "API is healthy"}
+# ---------------------------------------------------
+# GRAD-CAM ENDPOINT
+# ---------------------------------------------------
+@app.post("/gradcam")
+async def gradcam(file: UploadFile = File(...)):
+
+    try:
+        content = await file.read()
+        image = Image.open(io.BytesIO(content)).convert("RGB")
+    except:
+        raise HTTPException(status_code=400, detail="Invalid image file.")
+
+    validate_rbc_image(image)
+
+    # Prediction
+    label, confidence = predict_image(image)
+
+    # Grad-CAM
+    img_tensor = transform(image).unsqueeze(0)
+    gradcam = GradCAM(model, model.layer4[-1])
+    cam = gradcam.generate(img_tensor)
+
+    cam_base64 = encode_heatmap(cam)
+
+    return {
+        "prediction": label,
+        "confidence": round(confidence * 100, 2),
+        "gradcam": cam_base64
+    }
+
 
 @app.get("/")
 def home():
-    return {"message": "Malaria ResNet18 API is running!"}
+    return {"message": "Malaria API is running!"}
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
