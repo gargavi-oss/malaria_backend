@@ -72,34 +72,66 @@ def predict_image(image: Image.Image):
         confidence = probs[0][pred_idx].item()
     return class_names[pred_idx], confidence
 
-class GradCAM:
+class GradCAMPP:
+    """
+    Proper Grad-CAM++ implementation using hooks (compatible with ResNet18)
+    """
     def __init__(self, model, target_layer):
         self.model = model
+        self.model.eval()
         self.target_layer = target_layer
+
         self.gradients = None
         self.activations = None
-        target_layer.register_forward_hook(self._save_activation)
-        target_layer.register_backward_hook(self._save_gradient)
 
-    def _save_activation(self, module, input, output):
-        self.activations = output
+        def forward_hook(module, inp, out):
+            self.activations = out
 
-    def _save_gradient(self, module, grad_input, grad_output):
-        self.gradients = grad_output[0]
+        def backward_hook(module, grad_input, grad_output):
+            self.gradients = grad_output[0]
 
-    def generate(self, input_tensor):
+        target_layer.register_forward_hook(forward_hook)
+        target_layer.register_full_backward_hook(backward_hook)
+
+    def generate(self, input_tensor, class_idx=None):
+        torch.set_grad_enabled(True)
         self.model.zero_grad()
+
         output = self.model(input_tensor)
-        class_idx = output.argmax()
-        output[0, class_idx].backward()
-        grads = self.gradients           # [C,H,W]
-        acts = self.activations          # [C,H,W]
-        weights = torch.mean(grads, dim=(1, 2))  # GAP over gradients
-        cam = torch.sum(weights[:, None, None] * acts, dim=0)  # Weighted sum
+
+        # auto-select top class
+        if class_idx is None:
+            class_idx = int(output.argmax(dim=1).item())
+
+        # backward
+        loss = output[:, class_idx]
+        loss.backward(retain_graph=True)
+
+        A = self.activations[0]   # [C,H,W]
+        dA = self.gradients[0]    # [C,H,W]
+
+        dA2 = dA ** 2
+        dA3 = dA ** 3
+
+        # sum of activations per channel
+        S = A.sum(dim=(1, 2), keepdim=True)
+
+        eps = 1e-7
+        alpha_num = dA2
+        alpha_den = 2 * dA2 + S * dA3
+        alpha_den = torch.where(alpha_den != 0, alpha_den, eps)
+
+        alpha = alpha_num / (alpha_den + eps)
+
+        weights = (alpha * torch.relu(dA)).sum(dim=(1, 2))
+
+        cam = (weights[:, None, None] * A).sum(dim=0)
         cam = torch.relu(cam)
+
         cam -= cam.min()
-        cam /= cam.max() + 1e-9
-        return cam.detach().cpu().numpy()
+        cam /= cam.max() + 1e-8
+
+        return cam.cpu().numpy()
 
 
 def encode_heatmap(cam):
@@ -133,17 +165,25 @@ async def gradcam(file: UploadFile = File(...)):
         image = Image.open(io.BytesIO(content)).convert("RGB")
     except:
         raise HTTPException(status_code=400, detail="Invalid image file.")
+
     validate_rbc_image(image)
+
     label, confidence = predict_image(image)
+
     img_tensor = transform(image).unsqueeze(0)
-    gradcam = GradCAM(model, model.layer4[-1])
+
+    # UPDATED: Grad-CAM++
+    gradcam = GradCAMPP(model, model.layer4[-1])
+
     cam = gradcam.generate(img_tensor)
     cam_base64 = encode_heatmap(cam)
+
     return {
         "prediction": label,
         "confidence": round(confidence * 100, 2),
         "gradcam": cam_base64
     }
+
 
 @app.get("/")
 def home():
