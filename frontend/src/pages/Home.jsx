@@ -11,7 +11,7 @@ export default function Home() {
     });
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center text-center relative overflow-hidden px-4">
+    <div className="min-h-screen flex flex-col py-10 items-center justify-center text-center relative overflow-hidden px-4">
       <div className="absolute inset-0 bg-gradient-to-br from-blue-50 via-white to-teal-50 -z-10"></div>
       <div className="absolute -top-20 -left-20 w-72 h-72 bg-blue-100 rounded-full blur-3xl opacity-40"></div>
       <div className="absolute -bottom-20 -right-20 w-72 h-72 bg-teal-100 rounded-full blur-3xl opacity-40"></div>
