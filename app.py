@@ -22,7 +22,6 @@ app.add_middleware(
 
 def get_resnet18(num_classes=2):
     model = models.resnet18(pretrained=False)
-
     for param in model.parameters():
         param.requires_grad = False
     for param in model.layer4.parameters():
@@ -59,87 +58,58 @@ def validate_rbc_image(image: Image.Image):
     if ratio > 1.5:
         raise HTTPException(
             status_code=400,
-            detail="Image does not look like an RBC cell crop. Please upload a valid microscope image."
+            detail="Image does not look like an RBC cell crop."
         )
-    return True
 
 def predict_image(image: Image.Image):
     tensor = transform(image).unsqueeze(0)
     with torch.no_grad():
         out = model(tensor)
         probs = torch.softmax(out, dim=1)
-        pred_idx = torch.argmax(probs).item()
-        confidence = probs[0][pred_idx].item()
-    return class_names[pred_idx], confidence
+        idx = torch.argmax(probs).item()
+        conf = probs[0][idx].item()
+    return class_names[idx], conf
 
 class GradCAMPP:
-    """
-    Proper Grad-CAM++ implementation using hooks (compatible with ResNet18)
-    """
     def __init__(self, model, target_layer):
         self.model = model
         self.model.eval()
-        self.target_layer = target_layer
-
         self.gradients = None
         self.activations = None
-
-        def forward_hook(module, inp, out):
-            self.activations = out
-
-        def backward_hook(module, grad_input, grad_output):
-            self.gradients = grad_output[0]
-
-        target_layer.register_forward_hook(forward_hook)
-        target_layer.register_full_backward_hook(backward_hook)
-
+        target_layer.register_forward_hook(self._forward_hook)
+        target_layer.register_full_backward_hook(self._backward_hook)
+    def _forward_hook(self, module, inp, out):
+        self.activations = out
+    def _backward_hook(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
     def generate(self, input_tensor, class_idx=None):
         torch.set_grad_enabled(True)
         self.model.zero_grad()
-
         output = self.model(input_tensor)
-
-        # auto-select top class
         if class_idx is None:
             class_idx = int(output.argmax(dim=1).item())
-
-        # backward
-        loss = output[:, class_idx]
-        loss.backward(retain_graph=True)
-
-        A = self.activations[0]   # [C,H,W]
-        dA = self.gradients[0]    # [C,H,W]
-
+        output[:, class_idx].backward(retain_graph=True)
+        A = self.activations[0]   
+        dA = self.gradients[0]    
         dA2 = dA ** 2
         dA3 = dA ** 3
-
-        # sum of activations per channel
         S = A.sum(dim=(1, 2), keepdim=True)
-
         eps = 1e-7
-        alpha_num = dA2
-        alpha_den = 2 * dA2 + S * dA3
-        alpha_den = torch.where(alpha_den != 0, alpha_den, eps)
-
-        alpha = alpha_num / (alpha_den + eps)
-
+        alpha = dA2 / (2 * dA2 + S * dA3 + eps)
         weights = (alpha * torch.relu(dA)).sum(dim=(1, 2))
-
         cam = (weights[:, None, None] * A).sum(dim=0)
         cam = torch.relu(cam)
-
         cam -= cam.min()
         cam /= cam.max() + 1e-8
-
-        return cam.cpu().numpy()
+        return cam.detach().cpu().numpy()
 
 
 def encode_heatmap(cam):
     plt.figure(figsize=(3, 3))
-    plt.imshow(cam, cmap='jet', alpha=1.0)
+    plt.imshow(cam, cmap="jet")
     plt.axis("off")
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches='tight', pad_inches=0)
+    plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
     plt.close()
     buf.seek(0)
     return base64.b64encode(buf.read()).decode("utf-8")
@@ -147,48 +117,38 @@ def encode_heatmap(cam):
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
-        content = await file.read()
-        image = Image.open(io.BytesIO(content)).convert("RGB")
+        image = Image.open(io.BytesIO(await file.read())).convert("RGB")
     except:
         raise HTTPException(status_code=400, detail="Invalid image file.")
     validate_rbc_image(image)
-    label, confidence = predict_image(image)
+    label, conf = predict_image(image)
     return {
         "prediction": label,
-        "confidence": round(confidence * 100, 2)
+        "confidence": round(conf * 100, 2)
     }
 
 @app.post("/gradcam")
 async def gradcam(file: UploadFile = File(...)):
     try:
-        content = await file.read()
-        image = Image.open(io.BytesIO(content)).convert("RGB")
+        image = Image.open(io.BytesIO(await file.read())).convert("RGB")
     except:
         raise HTTPException(status_code=400, detail="Invalid image file.")
 
     validate_rbc_image(image)
-
-    label, confidence = predict_image(image)
-
+    label, conf = predict_image(image)
     img_tensor = transform(image).unsqueeze(0)
-
-    # UPDATED: Grad-CAM++
-    gradcam = GradCAMPP(model, model.layer4[-1])
-
-    cam = gradcam.generate(img_tensor)
-    cam_base64 = encode_heatmap(cam)
-
+    cam_generator = GradCAMPP(model, model.layer4[-1])
+    cam = cam_generator.generate(img_tensor)
     return {
         "prediction": label,
-        "confidence": round(confidence * 100, 2),
-        "gradcam": cam_base64
+        "confidence": round(conf * 100, 2),
+        "gradcam": encode_heatmap(cam)
     }
-
 
 @app.get("/")
 def home():
-    return {"message": "Malaria API is running!"}
+    return {"message": "Malaria API is running"}
 
 @app.get("/health")
-def health_check():
+def health():
     return {"status": "ok"}
