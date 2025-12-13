@@ -12,8 +12,8 @@ export default function useMobile() {
 
   return {
     width,
-    isMobile: width < 640,           // < 640px
+    isMobile: width < 640,           
     isTablet: width >= 640 && width < 1024, 
-    isDesktop: width >= 1024        // ≥ 1024px
+    isDesktop: width >= 1024        
   };
 }

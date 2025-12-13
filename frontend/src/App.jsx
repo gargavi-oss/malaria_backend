@@ -6,8 +6,12 @@ import Home from "./pages/Home";
 import Scan from "./pages/Scan";
 import About from "./pages/About";
 import Gradcam from "./pages/Gradcam";
+import { Toaster } from "react-hot-toast";
+
 
 function Layout() {
+
+<Toaster position="top-center" />
   const location = useLocation();
 
   const isHome = location.pathname === "/";

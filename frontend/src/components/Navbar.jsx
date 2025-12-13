@@ -16,7 +16,7 @@ export default function Navbar() {
       {({ open }) => (
         <>
 
-          <div className="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
+          <div className="max-w-7xl mx-auto px-4 py-4 flex justify-between items-center">
 
             <Link to="/" className="text-xl font-bold text-blue-600">
               Tiny Malaria Scan
